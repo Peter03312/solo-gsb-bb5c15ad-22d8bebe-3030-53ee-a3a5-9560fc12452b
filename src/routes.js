@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { get } = require('./db');
 const { ApiError, isInt, validateTimeline } = require('./validation');
-const { buildSrt } = require('./srt');
+const { buildSrt, parseSrt, findDraftConflicts } = require('./srt');
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'videos');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -355,6 +355,122 @@ router.delete('/videos/:id(\\d+)/segments/:sid(\\d+)', (req, res, next) => {
       get().prepare('DELETE FROM segments WHERE id = ?').run(seg.id);
     })();
     res.json({ ok: true, segments: listSegments(video.id) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- SRT 导入 ---------------- */
+
+// SRT 文件较小，直接内存解析不落盘；大小上限独立于视频上传
+const srtUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: Number(process.env.MAX_SRT_IMPORT_MB || 8) * 1024 * 1024 },
+});
+function srtUploadMw(req, res, next) {
+  srtUpload.single('file')(req, res, (err) => {
+    if (err && err.code === 'LIMIT_FILE_SIZE') {
+      next(new ApiError(422, 'file_too_large', 'SRT 文件超过大小上限（MAX_SRT_IMPORT_MB，默认 8MB）'));
+      return;
+    }
+    next(err);
+  });
+}
+
+// 草稿内容指纹：预览与确认之间任何草稿变动（增删改、审校切换）都会改变它，用作整批乐观锁
+function draftFingerprint(segments) {
+  const stable = segments.map((s) => [s.id, s.start_ms, s.end_ms, s.text, s.reviewed ? 1 : 0, s.revision]);
+  return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');
+}
+
+// 导入请求体：支持 JSON { content, mode, ... } 或 multipart（文件字段 file + 普通字段）
+function readImportPayload(req) {
+  let content = null;
+  let fileName = null;
+  if (req.file && req.file.buffer) {
+    content = req.file.buffer.toString('utf8');
+    fileName = req.file.originalname;
+  } else if (req.body && typeof req.body.content === 'string') {
+    content = req.body.content;
+    fileName = typeof req.body.file_name === 'string' ? req.body.file_name : null;
+  }
+  if (content == null) {
+    throw new ApiError(422, 'missing_content', '请提供 SRT 内容：JSON 字段 content，或 multipart 文件字段 file');
+  }
+  if (content.includes('\uFFFD')) {
+    throw new ApiError(422, 'invalid_encoding', '文件不是有效的 UTF-8 编码，请转换为 UTF-8（可含 BOM）后重试');
+  }
+  const mode = req.body && req.body.mode === 'replace' ? 'replace' : 'append';
+  return { content, mode, fileName };
+}
+
+// 预览：解析 + 校验 + 与当前草稿的冲突检测，不写任何数据；返回草稿指纹供确认时回传
+router.post('/videos/:id(\\d+)/srt-import/preview', srtUploadMw, (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const { content, mode, fileName } = readImportPayload(req);
+    const draft = listSegments(video.id);
+    const parsed = parseSrt(content, { durationMs: video.duration_ms });
+    const conflicts = mode === 'append' ? findDraftConflicts(parsed.cues, draft) : [];
+    res.json({
+      ok: parsed.errors.length === 0 && conflicts.length === 0,
+      mode,
+      file_name: fileName,
+      duration_ms: video.duration_ms,
+      cue_count: parsed.cues.length,
+      cues: parsed.cues,
+      errors: parsed.errors,
+      conflicts,
+      draft_segment_count: draft.length,
+      draft_fingerprint: draftFingerprint(draft),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 确认：事务内重算草稿指纹（被他人改过则 409 拒绝）、重新解析校验，整批写入或完全不变
+router.post('/videos/:id(\\d+)/srt-import/confirm', srtUploadMw, (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const { content, mode } = readImportPayload(req);
+    const fingerprint = req.body && req.body.draft_fingerprint;
+    if (typeof fingerprint !== 'string' || !fingerprint) {
+      throw new ApiError(422, 'missing_fingerprint', '请携带预览返回的 draft_fingerprint，以确认草稿未被他人修改');
+    }
+
+    const result = get().transaction(() => {
+      const draft = listSegments(video.id);
+      if (draftFingerprint(draft) !== fingerprint) {
+        throw new ApiError(409, 'draft_changed', '草稿在你预览之后已被他人修改，请重新预览后再确认导入（本次未写入任何内容）', {
+          draft_segment_count: draft.length,
+        });
+      }
+      const parsed = parseSrt(content, { durationMs: video.duration_ms });
+      if (parsed.errors.length > 0) {
+        throw new ApiError(422, 'invalid_srt', `SRT 内容存在 ${parsed.errors.length} 处问题，未写入任何片段`, { items: parsed.errors });
+      }
+      if (mode === 'append') {
+        const conflicts = findDraftConflicts(parsed.cues, draft);
+        if (conflicts.length > 0) {
+          throw new ApiError(422, 'import_conflict', `导入片段与现有草稿存在 ${conflicts.length} 处时间冲突，未写入任何片段`, { items: conflicts });
+        }
+      } else {
+        // 替换模式：仅清空草稿片段，已发布版本及其 SRT 不受影响
+        get().prepare('DELETE FROM segments WHERE video_id = ?').run(video.id);
+      }
+      const insert = get().prepare(
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      );
+      const ts = now();
+      for (const cue of parsed.cues) {
+        insert.run(video.id, cue.start_ms, cue.end_ms, cue.text, ts);
+      }
+      return { imported: parsed.cues.length };
+    })();
+
+    res.status(201).json({ ok: true, mode, imported: result.imported, segments: listSegments(video.id) });
   } catch (err) {
     next(err);
   }

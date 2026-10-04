@@ -59,6 +59,33 @@
     </div>
   </div>
 
+  <!-- SRT 导入弹窗 -->
+  <div id="importModal" class="modal hidden">
+    <div class="modal-card" style="width:720px">
+      <h3>📥 导入 SRT 字幕</h3>
+      <p class="meta">选择本地 SRT 文件（UTF-8，可含 BOM；序号可不连续，支持多行文本）。先预览解析结果与冲突，
+        确认后才会写入；导入的片段均为「待审」，已发布版本不受影响。</p>
+      <div class="form-row">
+        <label>SRT 文件
+          <input type="file" id="importFile" accept=".srt,text/plain" />
+        </label>
+        <label>写入方式
+          <select id="importMode">
+            <option value="append">追加到现有草稿</option>
+            <option value="replace">替换整个草稿</option>
+          </select>
+        </label>
+        <button type="button" class="btn" id="importPreviewBtn">预览解析</button>
+      </div>
+      <p id="importError" class="error"></p>
+      <div id="importPreview"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="importCancel">取消</button>
+        <button type="button" class="btn primary" id="importConfirmBtn" disabled>确认导入</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>

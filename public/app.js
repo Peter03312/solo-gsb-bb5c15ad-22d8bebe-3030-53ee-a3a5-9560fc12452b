@@ -9,6 +9,8 @@ const state = {
   publications: [],
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
+  importPreview: null, // 最近一次 SRT 预览响应（含 draft_fingerprint）
+  importContent: null, // 预览时读出的 SRT 文本，确认时原样回传
   pollTimer: null,
 };
 
@@ -208,7 +210,9 @@ function stopPolling() {
   state.pollTimer = null;
 }
 function anyModalOpen() {
-  return !$('editorModal').classList.contains('hidden') || !$('conflictModal').classList.contains('hidden');
+  return !$('editorModal').classList.contains('hidden')
+    || !$('conflictModal').classList.contains('hidden')
+    || !$('importModal').classList.contains('hidden');
 }
 async function pollRefresh() {
   if (anyModalOpen() || !state.video) return;
@@ -252,7 +256,10 @@ function renderDetail() {
         <section class="card">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <h2 style="margin:0">片段列表</h2>
-            <button class="btn primary small" id="addBtn">＋ 新增片段</button>
+            <div style="display:flex;gap:8px">
+              <button class="btn small" id="importBtn">📥 导入 SRT</button>
+              <button class="btn primary small" id="addBtn">＋ 新增片段</button>
+            </div>
           </div>
           <p class="meta">所有写操作都会携带你当前看到的修订号；修订号过期时服务端拒绝并返回冲突，绝不覆盖他人修改。</p>
           <div class="side-scroll">
@@ -271,6 +278,7 @@ function renderDetail() {
 
   $('backLink').addEventListener('click', backToList);
   $('addBtn').addEventListener('click', () => openEditor('create'));
+  $('importBtn').addEventListener('click', openImport);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -527,6 +535,116 @@ function showConflict(message, current, editorCtx) {
   };
 }
 
+/* ================= SRT 导入 ================= */
+function openImport() {
+  state.importPreview = null;
+  state.importContent = null;
+  $('importFile').value = '';
+  $('importError').textContent = '';
+  $('importPreview').innerHTML = '<p class="meta">选择文件后点击「预览解析」；校验通过前不会写入任何内容。</p>';
+  $('importConfirmBtn').disabled = true;
+  $('importModal').classList.remove('hidden');
+}
+
+function closeImport() {
+  state.importPreview = null;
+  state.importContent = null;
+  $('importModal').classList.add('hidden');
+}
+
+// 文件或写入方式变化后，旧预览（含草稿指纹）即失效，必须重新预览
+function invalidateImportPreview(note) {
+  state.importPreview = null;
+  $('importConfirmBtn').disabled = true;
+  $('importPreview').innerHTML = `<p class="meta">${note}，请重新「预览解析」。</p>`;
+}
+
+async function runImportPreview() {
+  const file = $('importFile').files[0];
+  const errEl = $('importError');
+  errEl.textContent = '';
+  if (!file) { errEl.textContent = '请先选择 SRT 文件'; return; }
+  let content;
+  try {
+    content = await file.text(); // 浏览器按 UTF-8 解码
+  } catch (_) {
+    errEl.textContent = '无法读取所选文件';
+    return;
+  }
+  state.importContent = content;
+  invalidateImportPreview('正在预览');
+  try {
+    const data = await api(`/api/videos/${state.video.id}/srt-import/preview`, {
+      method: 'POST',
+      body: { content, mode: $('importMode').value, file_name: file.name },
+    });
+    state.importPreview = data;
+    renderImportPreview(data);
+    $('importConfirmBtn').disabled = !data.ok;
+  } catch (err) {
+    $('importPreview').innerHTML = '';
+    errEl.textContent = `预览失败：${err.message}`;
+  }
+}
+
+function renderImportPreview(data) {
+  const modeLabel = data.mode === 'replace' ? '替换整个草稿' : '追加到现有草稿';
+  let html = `<p class="meta">文件 ${esc(data.file_name || '(未命名)')} ｜ ${modeLabel} ｜ 解析出 ${data.cue_count} 条 ｜ 当前草稿 ${data.draft_segment_count} 条</p>`;
+  if (data.errors && data.errors.length) {
+    html += `<div class="import-issues bad"><b>解析问题（${data.errors.length}），需修正文件：</b><ul>` +
+      data.errors.map((e) => `<li>${esc(e.message)}</li>`).join('') + '</ul></div>';
+  }
+  if (data.conflicts && data.conflicts.length) {
+    html += `<div class="import-issues warn"><b>与当前草稿的时间冲突（${data.conflicts.length}）：</b><ul>` +
+      data.conflicts.map((c) => `<li>${esc(c.message)}</li>`).join('') + '</ul></div>';
+  }
+  if (data.cues && data.cues.length) {
+    html += '<div class="side-scroll" style="max-height:240px"><table class="seg-table">' +
+      '<thead><tr><th>行号</th><th>时间</th><th>文本</th></tr></thead><tbody>' +
+      data.cues.map((c) => `<tr><td class="mono">${c.line}</td>` +
+        `<td class="mono">${fmtTime(c.start_ms)}<br>→ ${fmtTime(c.end_ms)}</td>` +
+        `<td class="seg-text-cell">${esc(c.text)}</td></tr>`).join('') +
+      '</tbody></table></div>';
+  }
+  html += data.ok
+    ? '<p style="color:var(--ok);margin-top:8px">✓ 校验通过，可确认导入；导入的片段均为「待审」。</p>'
+    : '<p class="error">存在以上问题，无法导入；请修正文件或调整草稿后重新预览。</p>';
+  $('importPreview').innerHTML = html;
+}
+
+async function runImportConfirm() {
+  const p = state.importPreview;
+  if (!p || state.importContent == null) return;
+  const errEl = $('importError');
+  errEl.textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/srt-import/confirm`, {
+      method: 'POST',
+      body: { content: state.importContent, mode: p.mode, draft_fingerprint: p.draft_fingerprint },
+    });
+    state.segments = data.segments;
+    closeImport();
+    renderSegmentDependent();
+    toast(`已导入 ${data.imported} 条片段（均为待审）`);
+  } catch (err) {
+    if (err.status === 409) {
+      // 预览之后草稿被他人修改：绝不覆盖，要求重新预览
+      state.importPreview = null;
+      $('importConfirmBtn').disabled = true;
+      errEl.textContent = `冲突：${err.message}`;
+      await refreshCurrent();
+      return;
+    }
+    if (err.data && Array.isArray(err.data.items)) {
+      renderImportPreview({ ...p, ok: false, errors: err.data.items, conflicts: [] });
+      $('importConfirmBtn').disabled = true;
+      errEl.textContent = err.message;
+      return;
+    }
+    errEl.textContent = `导入失败：${err.message}`;
+  }
+}
+
 /* ================= 发布 / 下载 ================= */
 function computeStatus() {
   const problems = [];
@@ -621,6 +739,12 @@ $('editorSave').addEventListener('click', saveEditor);
 $('editStartNow').addEventListener('click', () => { $('editStart').value = currentMs(); });
 $('editEndNow').addEventListener('click', () => { $('editEnd').value = currentMs(); });
 $('editorModal').addEventListener('click', (e) => { if (e.target === $('editorModal')) closeEditor(); });
+$('importCancel').addEventListener('click', closeImport);
+$('importPreviewBtn').addEventListener('click', runImportPreview);
+$('importConfirmBtn').addEventListener('click', runImportConfirm);
+$('importModal').addEventListener('click', (e) => { if (e.target === $('importModal')) closeImport(); });
+$('importFile').addEventListener('change', () => invalidateImportPreview('文件已更改'));
+$('importMode').addEventListener('change', () => invalidateImportPreview('写入方式已更改'));
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

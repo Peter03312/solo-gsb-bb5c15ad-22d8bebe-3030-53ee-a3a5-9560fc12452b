@@ -217,6 +217,150 @@ async function main() {
   check('Range 请求返回 206', rangeRes.status === 206);
   eq('Content-Range 正确', rangeRes.headers.get('content-range'), 'bytes 0-15/256');
 
+  console.log('7. SRT 导入：预览、校验与原子写入');
+  const imp = await uploadVideo('导入测试', 10000, 64);
+  r = await req('POST', `/videos/${imp.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '已有片段' });
+  check('预置草稿片段 201', r.status === 201);
+
+  // 合法文件：BOM + 序号不连续 + 多行文本 + 与草稿端点相接
+  const goodSrt = '\uFEFF' + '1\n00:00:02,000 --> 00:00:03,000\n第二句\n\n7\n00:00:03,500 --> 00:00:04,500\n第三句\n跨两行文本\n';
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: goodSrt, mode: 'append' });
+  check('预览 200 且 ok', r.status === 200 && r.json.ok === true, JSON.stringify(r.json));
+  eq('解析出 2 条', r.json.cue_count, 2);
+  eq('首条原文件行号', r.json.cues[0].line, 1);
+  eq('次条原文件行号', r.json.cues[1].line, 5);
+  eq('多行文本保留换行', r.json.cues[1].text, '第三句\n跨两行文本');
+  eq('端点相接不算冲突', r.json.conflicts, []);
+  const fp1 = r.json.draft_fingerprint;
+  check('返回草稿指纹', typeof fp1 === 'string' && fp1.length > 0);
+
+  // 各类非法内容：预览指出具体条目，且均不得写入
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '  \n\n', mode: 'append' });
+  check('空文件报错', r.json.ok === false && /为空/.test(r.json.errors[0].message), JSON.stringify(r.json));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '1\n这不是时间戳\n文本\n', mode: 'append' });
+  check('时间戳格式错误指出行号', r.json.errors.some((e) => e.line === 2 && /时间戳格式错误/.test(e.message)), JSON.stringify(r.json.errors));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '1\n00:00:02,000 --> 00:00:03,000\n', mode: 'append' });
+  check('缺少字幕文本报错', r.json.errors.some((e) => /缺少字幕文本/.test(e.message)));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '1\n-00:00:02,000 --> 00:00:03,000\n负\n', mode: 'append' });
+  check('负时间报错', r.json.errors.some((e) => /不能为负/.test(e.message)), JSON.stringify(r.json.errors));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '1\n00:00:03,000 --> 00:00:02,000\n倒置\n', mode: 'append' });
+  check('起止倒置报错', r.json.errors.some((e) => /起点必须早于终点/.test(e.message)));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '1\n00:00:09,000 --> 00:00:12,000\n超长\n', mode: 'append' });
+  check('越过视频时长报错', r.json.errors.some((e) => /超过视频时长/.test(e.message)));
+  const overlapSrt = '1\n00:00:05,000 --> 00:00:07,000\n甲\n\n2\n00:00:06,000 --> 00:00:08,000\n乙\n';
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: overlapSrt, mode: 'append' });
+  check('文件内重叠指出两条', r.json.errors.some((e) => /重叠/.test(e.message) && /第 1 条/.test(e.message) && /第 2 条/.test(e.message)), JSON.stringify(r.json.errors));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: '00:00:05,000 --> 00:00:06,000\n无序号\n', mode: 'append' });
+  check('缺序号行报错', r.json.errors.some((e) => /序号/.test(e.message)));
+
+  // 与草稿冲突：append 列出冲突，replace 不检查草稿
+  const conflictSrt = '1\n00:00:01,500 --> 00:00:02,500\n撞上已有\n';
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: conflictSrt, mode: 'append' });
+  check('追加模式列出与草稿的冲突', r.json.ok === false && r.json.conflicts.length === 1 && r.json.conflicts[0].segment_id != null, JSON.stringify(r.json.conflicts));
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: conflictSrt, mode: 'replace' });
+  check('替换模式不与草稿冲突', r.json.ok === true && r.json.conflicts.length === 0);
+
+  // 预览阶段不落库
+  let impSegs = (await req('GET', `/videos/${imp.id}`)).json.segments;
+  eq('预览不写入任何内容', impSegs.map((s) => s.text), ['已有片段']);
+
+  // 确认追加：指纹匹配 -> 整批写入，导入片段待审
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: goodSrt, mode: 'append', draft_fingerprint: fp1 });
+  check('确认追加 201', r.status === 201, JSON.stringify(r.json));
+  eq('导入 2 条', r.json.imported, 2);
+  eq('草稿共 3 条', r.json.segments.length, 3);
+  check('导入片段均为待审', r.json.segments.every((s) => !s.reviewed));
+  check('导入片段修订号为 1', r.json.segments.filter((s) => s.text.includes('句')).every((s) => s.revision === 1));
+
+  // 预览后草稿被他人修改 -> 确认 409，草稿完全不变
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: goodSrt, mode: 'replace' });
+  const fpStale = r.json.draft_fingerprint;
+  r = await req('POST', `/videos/${imp.id}/segments`, { start_ms: 8000, end_ms: 9000, text: '他人插入' });
+  check('他人修改草稿成功', r.status === 201);
+  const beforeIds = (await req('GET', `/videos/${imp.id}`)).json.segments.map((s) => s.id);
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: goodSrt, mode: 'replace', draft_fingerprint: fpStale });
+  check('过期指纹 -> 409 要求重新预览', r.status === 409 && /重新预览/.test(r.json.error.message), JSON.stringify(r.json));
+  const afterIds = (await req('GET', `/videos/${imp.id}`)).json.segments.map((s) => s.id);
+  eq('409 时草稿完全不变', afterIds, beforeIds);
+
+  // 确认时内容非法 -> 422 且原子回滚
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: goodSrt, mode: 'append' });
+  const fp2 = r.json.draft_fingerprint;
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: overlapSrt, mode: 'append', draft_fingerprint: fp2 });
+  check('确认时内容非法 -> 422 带条目明细', r.status === 422 && Array.isArray(r.json.error.items), JSON.stringify(r.json));
+  impSegs = (await req('GET', `/videos/${imp.id}`)).json.segments;
+  eq('非法确认未写入任何片段', impSegs.map((s) => s.id), beforeIds);
+
+  // 确认时与草稿冲突 -> 422 不写入
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: conflictSrt, mode: 'append' });
+  const fp3 = r.json.draft_fingerprint;
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: conflictSrt, mode: 'append', draft_fingerprint: fp3 });
+  check('确认时与草稿冲突 -> 422', r.status === 422 && /冲突/.test(r.json.error.message), JSON.stringify(r.json));
+
+  // 缺指纹 / 缺内容
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: goodSrt, mode: 'append' });
+  check('缺指纹 -> 422', r.status === 422);
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { mode: 'append' });
+  check('缺内容 -> 422', r.status === 422);
+
+  // 替换导入：仅替换草稿，已发布版本及其 SRT 保持不变
+  impSegs = (await req('GET', `/videos/${imp.id}`)).json.segments;
+  for (const s of impSegs) {
+    r = await req('POST', `/videos/${imp.id}/segments/${s.id}/review`, { reviewed: true, revision: s.revision });
+    check(`审校草稿 #${s.id}`, r.status === 200);
+  }
+  r = await req('POST', `/videos/${imp.id}/publish`, {});
+  check('导入前发布 v1', r.status === 201, JSON.stringify(r.json));
+  const publishedBefore = await (await fetch(`${BASE}/videos/${imp.id}/srt?version=published`)).text();
+
+  const replaceSrt = '5\n00:00:00,500 --> 00:00:01,500\n替换后的第一句\n\n9\n00:00:02,000 --> 00:00:03,000\n替换后的第二句\n';
+  r = await req('POST', `/videos/${imp.id}/srt-import/preview`, { content: replaceSrt, mode: 'replace' });
+  check('替换预览 ok', r.json.ok === true, JSON.stringify(r.json));
+  r = await req('POST', `/videos/${imp.id}/srt-import/confirm`, { content: replaceSrt, mode: 'replace', draft_fingerprint: r.json.draft_fingerprint });
+  check('替换确认 201', r.status === 201, JSON.stringify(r.json));
+  eq('替换后草稿仅 2 条', r.json.segments.length, 2);
+  eq('替换后文本', r.json.segments.map((s) => s.text), ['替换后的第一句', '替换后的第二句']);
+  check('替换后均为待审', r.json.segments.every((s) => !s.reviewed));
+
+  const publishedAfter = await (await fetch(`${BASE}/videos/${imp.id}/srt?version=published`)).text();
+  check('已发布版本 SRT 保持不变', publishedAfter === publishedBefore && /已有片段/.test(publishedAfter));
+  const draftAfter = await (await fetch(`${BASE}/videos/${imp.id}/srt?version=draft`)).text();
+  check('草稿 SRT 反映替换结果', /替换后的第一句/.test(draftAfter) && !/已有片段/.test(draftAfter));
+  const impPubs = (await req('GET', `/videos/${imp.id}/publications`)).json.publications;
+  eq('发布版本列表不变', impPubs.map((p) => p.version), [1]);
+
+  // multipart 文件上传预览（与 JSON 等效）
+  {
+    const boundary = '----srtboundary' + Math.random().toString(16).slice(2);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="mode"\r\n\r\nappend\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="subs.srt"\r\nContent-Type: application/x-subrip\r\n\r\n`),
+      Buffer.from('1\n00:00:06,000 --> 00:00:07,000\nmultipart 条目\n', 'utf8'),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const res = await fetch(`${BASE}/videos/${imp.id}/srt-import/preview`, {
+      method: 'POST', headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }, body,
+    });
+    const json = await res.json();
+    check('multipart 预览可用', res.status === 200 && json.ok === true && json.cue_count === 1, JSON.stringify(json));
+    eq('multipart 返回文件名', json.file_name, 'subs.srt');
+  }
+
+  // 非 UTF-8 内容被拒绝
+  {
+    const boundary = '----srtboundary' + Math.random().toString(16).slice(2);
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="gbk.srt"\r\n\r\n`),
+      Buffer.from([0x31, 0x0a, 0x30, 0x30, 0x3a, 0x30, 0x30, 0x3a, 0x30, 0x31, 0x2c, 0x30, 0x30, 0x30, 0x20, 0x2d, 0x2d, 0x3e, 0x20, 0x30, 0x30, 0x3a, 0x30, 0x30, 0x3a, 0x30, 0x32, 0x2c, 0x30, 0x30, 0x30, 0x0a, 0xc4, 0xe3, 0xba, 0xc3, 0x0a]),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const res = await fetch(`${BASE}/videos/${imp.id}/srt-import/preview`, {
+      method: 'POST', headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }, body,
+    });
+    const json = await res.json();
+    check('非 UTF-8 文件 -> 422 编码提示', res.status === 422 && /UTF-8/.test(json.error.message), JSON.stringify(json));
+  }
+
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
 }

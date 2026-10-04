@@ -27,6 +27,10 @@ app.use((err, req, res, next) => {
     res.status(400).json({ error: { code: 'bad_json', message: '请求体不是合法 JSON' } });
     return;
   }
+  if (err && err.type === 'entity.too.large') {
+    res.status(422).json({ error: { code: 'payload_too_large', message: '请求体超过大小上限（JSON 限 2MB；更大的 SRT 请用 multipart 文件上传）' } });
+    return;
+  }
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     res.status(422).json({ error: { code: 'file_too_large', message: '视频文件超过上传大小上限（MAX_UPLOAD_MB）' } });
     return;
