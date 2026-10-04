@@ -59,6 +59,45 @@
     </div>
   </div>
 
+  <!-- SRT 导入弹窗 -->
+  <div id="importModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>导入本地 SRT 到草稿</h3>
+      <p class="meta">导入的片段一律为<b>待审</b>状态；已发布版本及其 SRT 不会受影响。
+        先预览解析结果与时间冲突，再选择「追加到草稿」或「替换整个草稿」。</p>
+      <div class="form-row">
+        <label>SRT 文件（UTF-8，可含 BOM）
+          <input type="file" id="importFile" accept=".srt,text/plain" />
+        </label>
+        <button type="button" class="btn primary" id="importPreviewBtn">解析并预览</button>
+      </div>
+      <p id="importFileMsg" class="meta"></p>
+      <p id="importError" class="error"></p>
+
+      <div id="importResult" class="hidden">
+        <p class="meta" id="importSummary"></p>
+        <div id="importConflictBox" class="conflict-box hidden">
+          <b>⚠️ 与当前草稿的时间冲突</b>
+          <ul id="importConflictList"></ul>
+          <p class="warn">存在冲突时「追加到草稿」不可用；可先调整已有片段，或选择「替换整个草稿」。</p>
+        </div>
+        <div class="import-scroll">
+          <table class="seg-table">
+            <thead><tr><th>条目</th><th>SRT 序号</th><th>原文件行号</th><th>时间</th><th>文本</th></tr></thead>
+            <tbody id="importTbody"></tbody>
+          </table>
+          <p class="meta hidden" id="importMoreHint"></p>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="importCancel">取消</button>
+        <button type="button" class="btn danger" id="importReplaceBtn" disabled>替换整个草稿（先删除现有草稿片段）</button>
+        <button type="button" class="btn primary" id="importAppendBtn" disabled>追加到草稿</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>

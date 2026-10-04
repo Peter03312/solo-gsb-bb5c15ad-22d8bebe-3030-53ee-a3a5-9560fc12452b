@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { get } = require('./db');
 const { ApiError, isInt, validateTimeline } = require('./validation');
-const { buildSrt } = require('./srt');
+const { buildSrt, parseSrt } = require('./srt');
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'videos');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -22,6 +22,16 @@ const upload = multer({
   }),
   limits: { fileSize: Number(process.env.MAX_UPLOAD_MB || 2048) * 1024 * 1024 },
 });
+
+// SRT 文件较小，仅在内存中解析，不落盘
+const MAX_SRT_BYTES = Number(process.env.MAX_SRT_KB || 10240) * 1024;
+const srtUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_SRT_BYTES },
+});
+
+// 预览令牌签名密钥：随进程生成；服务重启后旧预览令牌失效（要求重新预览，符合语义）
+const TOKEN_SECRET = crypto.randomBytes(32);
 
 const router = express.Router();
 
@@ -460,6 +470,251 @@ router.get('/videos/:id(\\d+)/srt', (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(video.title)}-${label}.srt`);
     res.setHeader('X-Subtitle-Desc', encodeURIComponent(displayName));
     res.send(buildSrt(segments));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ---------------- SRT 导入（预览 -> 确认追加/替换草稿） ---------------- */
+
+function entryLabel(e) {
+  return `导入条目「序号 ${e.seq == null ? '(缺)' : e.seq}」（原文件第 ${e.line} 行）`;
+}
+function existingLabel(s) {
+  return `现有草稿片段 #${s.id}`;
+}
+
+// 语义校验：负时间 / 起止倒置 / 越过视频时长 / 导入条目之间重叠；文本过长
+// 返回 { errors, validEntries }，其中重叠只在各项基础时间合法时检查
+function evaluateImportedEntries(entries, durationMs) {
+  const errors = [];
+  const valid = [];
+  entries.forEach((e) => {
+    let selfOk = true;
+    if (e.start_ms < 0 || e.end_ms < 0) {
+      errors.push({ code: 'negative_time', entry: e.entry, seq: e.seq, line: e.line,
+        message: `${entryLabel(e)}：时间不能为负数（起点 ${e.start_ms}ms / 终点 ${e.end_ms}ms）` });
+      selfOk = false;
+    }
+    if (e.start_ms >= 0 && e.end_ms >= 0 && e.start_ms >= e.end_ms) {
+      errors.push({ code: 'reversed_time', entry: e.entry, seq: e.seq, line: e.line,
+        message: `${entryLabel(e)}：起点（${e.start_ms}ms）必须早于终点（${e.end_ms}ms）` });
+      selfOk = false;
+    }
+    if (e.end_ms > durationMs) {
+      errors.push({ code: 'beyond_duration', entry: e.entry, seq: e.seq, line: e.line,
+        message: `${entryLabel(e)}：终点 ${e.end_ms}ms 越过视频时长 ${durationMs}ms` });
+      selfOk = false;
+    }
+    if (e.text.length > 10000) {
+      errors.push({ code: 'text_too_long', entry: e.entry, seq: e.seq, line: e.line,
+        message: `${entryLabel(e)}：字幕文本 ${e.text.length} 字符，超过单条 10000 字符上限` });
+      selfOk = false;
+    }
+    if (selfOk) valid.push(e);
+  });
+
+  const ordered = [...valid].sort((a, b) => a.start_ms - b.start_ms || a.entry - b.entry);
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1];
+    const cur = ordered[i];
+    if (cur.start_ms < prev.end_ms) {
+      errors.push({ code: 'imported_overlap', entry: cur.entry, seq: cur.seq, line: cur.line,
+        message: `${entryLabel(prev)} 与 ${entryLabel(cur)} 时间重叠（${cur.start_ms}ms 早于 ${prev.end_ms}ms，端点相接允许）` });
+    }
+  }
+  return { errors, validEntries: errors.length ? [] : valid };
+}
+
+// 追加模式：逐条给出与现有草稿的冲突（仅信息性；存在冲突时禁止确认追加）
+function draftConflicts(existing, entries) {
+  const conflicts = [];
+  entries.forEach((e) => {
+    for (const s of existing) {
+      if (e.start_ms < s.end_ms && s.start_ms < e.end_ms) {
+        conflicts.push({
+          entry: e.entry,
+          seq: e.seq,
+          line: e.line,
+          segment_id: s.id,
+          start_ms: s.start_ms,
+          end_ms: s.end_ms,
+          message: `${entryLabel(e)}（${e.start_ms}–${e.end_ms}ms）与${existingLabel(s)}（${s.start_ms}–${s.end_ms}ms）时间冲突`,
+        });
+      }
+    }
+  });
+  return conflicts;
+}
+
+// 草稿快照指纹：任何修改（增删改、审校）都会改变结果
+function draftFingerprint(segments) {
+  const payload = segments
+    .map((s) => [s.id, s.start_ms, s.end_ms, s.text, s.reviewed, s.revision].join('|'))
+    .join('\n');
+  return crypto.createHash('sha256').update(payload, 'utf8').digest('hex');
+}
+function srtHash(content) {
+  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+}
+function makePreviewToken({ videoId, mode, draftHash, contentHash }) {
+  const payload = JSON.stringify({ v: videoId, m: mode, d: draftHash, c: contentHash });
+  const b64 = Buffer.from(payload, 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url');
+  return `${b64}.${sig}`;
+}
+function readPreviewToken(token) {
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  const [b64, sig] = token.split('.');
+  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(b64).digest('base64url');
+  const a = Buffer.from(sig || '');
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    return JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+// 从 multipart（字段 srt）或 JSON（字段 content，UTF-8 字符串）读取待导入文本
+function readSrtInput(req) {
+  if (req.file) {
+    return { content: req.file.buffer.toString('utf8'), filename: req.file.originalname || 'import.srt' };
+  }
+  if (req.body && typeof req.body.content === 'string') {
+    return { content: req.body.content, filename: req.body.filename || 'inline.srt' };
+  }
+  throw new ApiError(422, 'missing_srt', '请上传 SRT 文件（multipart 字段名 srt）或在 JSON 体中提供 content 字段（UTF-8 文本）');
+}
+
+function invalidSrtError(message, errors) {
+  return new ApiError(422, 'invalid_srt', message, { errors });
+}
+
+// 解析 + 语义校验；任何错误都抛 422 invalid_srt，绝不写入
+function parseAndEvaluate(content, video) {
+  const parsed = parseSrt(content);
+  if (!parsed.ok) {
+    throw invalidSrtError(`SRT 解析失败，共 ${parsed.errors.length} 处格式问题，未写入任何内容：\n${parsed.errors[0].message}`,
+      parsed.errors);
+  }
+  const { errors, validEntries } = evaluateImportedEntries(parsed.entries, video.duration_ms);
+  if (errors.length) {
+    throw invalidSrtError(`SRT 时间校验失败，共 ${errors.length} 处问题，未写入任何内容：\n${errors[0].message}`, errors);
+  }
+  return validEntries;
+}
+
+// 仅在 multipart 请求时解析 SRT 上传；JSON（content 字段）请求直接放行
+function srtUploadOptional(req, res, next) {
+  if (!/^multipart\/form-data/i.test(req.headers['content-type'] || '')) return next();
+  srtUpload.single('srt')(req, res, (err) => {
+    if (err && err.code === 'LIMIT_FILE_SIZE') {
+      next(new ApiError(422, 'srt_too_large', `SRT 文件超过大小上限（MAX_SRT_KB，当前上限 ${Math.round(MAX_SRT_BYTES / 1024)} KB）`));
+      return;
+    }
+    next(err);
+  });
+}
+
+router.post('/videos/:id(\\d+)/srt/preview', srtUploadOptional, (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const { content, filename } = readSrtInput(req);
+    const entries = parseAndEvaluate(content, video);
+    const existing = listSegments(video.id);
+    const conflicts = draftConflicts(existing, entries);
+
+    const draftHash = draftFingerprint(existing);
+    const contentHash = srtHash(content);
+    const token = makePreviewToken({
+      videoId: video.id, mode: 'preview', draftHash, contentHash,
+    });
+
+    res.json({
+      filename,
+      duration_ms: video.duration_ms,
+      draft_count: existing.length,
+      imported_count: entries.length,
+      entries: entries.map((e) => ({
+        entry: e.entry,
+        seq: e.seq,
+        line: e.line,
+        time_line: e.time_line,
+        start_ms: e.start_ms,
+        end_ms: e.end_ms,
+        text: e.text,
+      })),
+      conflicts,
+      append_blocked: conflicts.length > 0,
+      token,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/videos/:id(\\d+)/srt/import', srtUploadOptional, (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const mode = req.body && req.body.mode === 'replace' ? 'replace' : req.body && req.body.mode === 'append' ? 'append' : null;
+    if (!mode) throw new ApiError(422, 'invalid_mode', '请指定写入方式 mode：append（追加到草稿）或 replace（替换整个草稿）');
+    const token = readPreviewToken(req.body && req.body.token);
+    if (!token) {
+      throw new ApiError(409, 'preview_required', '缺少有效的预览令牌：请先调用预览接口，再以预览返回的 token 确认');
+    }
+
+    const { content } = readSrtInput(req);
+    const currentSegments = listSegments(video.id);
+    const currentDraftHash = draftFingerprint(currentSegments);
+    if (token.v !== video.id || token.m !== 'preview' || token.d !== currentDraftHash) {
+      throw new ApiError(409, 'draft_changed',
+        '预览之后草稿已被修改（可能是他人操作）。为避免覆盖更改，请重新预览后再确认；本次未写入任何内容',
+        { current_segments: currentSegments });
+    }
+    if (token.c !== srtHash(content)) {
+      throw new ApiError(422, 'srt_changed', '确认时提交的 SRT 内容与预览时不一致，请重新预览后再确认；本次未写入任何内容');
+    }
+
+    // 重新解析与全量校验（不信任预览结果），并在同一事务内整批写入
+    const result = get().transaction(() => {
+      const lockedVideo = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!lockedVideo) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+
+      const entries = parseAndEvaluate(content, lockedVideo);
+
+      if (mode === 'append') {
+        const existingRows = get().prepare('SELECT * FROM segments WHERE video_id = ?').all(videoId);
+        const conflicts = draftConflicts(existingRows, entries);
+        if (conflicts.length) {
+          throw invalidSrtError(
+            `追加被阻止：导入条目与当前草稿存在 ${conflicts.length} 处时间冲突，请先调整草稿或改用替换；本次未写入任何内容：\n${conflicts[0].message}`,
+            conflicts.map((c) => ({ code: 'draft_conflict', ...c })));
+        }
+      }
+
+      const ts = now();
+      const insert = get().prepare(
+        `INSERT INTO segments (video_id, start_ms, end_ms, text, reviewed, revision, updated_at)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      );
+      if (mode === 'replace') {
+        get().prepare('DELETE FROM segments WHERE video_id = ?').run(videoId);
+      }
+      for (const e of entries) {
+        insert.run(videoId, e.start_ms, e.end_ms, e.text, ts);
+      }
+      return { mode, imported_count: entries.length };
+    })();
+
+    res.status(201).json({
+      ok: true,
+      mode: result.mode,
+      imported_count: result.imported_count,
+      segments: listSegments(video.id),
+    });
   } catch (err) {
     next(err);
   }
